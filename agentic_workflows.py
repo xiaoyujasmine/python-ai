@@ -77,7 +77,10 @@ async def _call_single_model(call_spec):
             result = await response.json()
 
             message = result["choices"][0]["message"]["content"]
-            return message
+            # Real models routinely emit a leading newline ("\nfalse") or wrap
+            # output in markdown. Without this strip, "\nfalse" != "false" and
+            # every route in Step 5 is treated as a hit.
+            return message.strip()
 
 
 async def _call_models_async(call_list):
