@@ -41,6 +41,27 @@ Response: The price for listing 123456 is $350,000.
 配置读取顺序：**命令行 export > `.env` > 代码默认值**（`http://your_server_ip:8000/v1/chat/completions`，需自行替换）。
 三个入口脚本（`test_workflow.py` / `demo_routes.py` / `check_provider.py`）启动时都会自动加载 `.env`，无需反复 export。
 
+第四个变量 `PROMPT_VARIANT` 选提示集，见下方「提示变体」。
+
+### 提示变体（真实模型必读）
+
+教程的三套提示是为 Mistral-Small-3.2-24B 写的，9B 级别的模型扛不住（实测数据见「排查」）。
+所以代码里内置两套，用 `PROMPT_VARIANT` 切换：
+
+| 值 | 说明 | SiliconFlow `THUDM/GLM-4-9B-0414` 实测 |
+|---|---|---|
+| `original` | 教程原文，逐字未改 | 7 个分支 **5/7** 正确 |
+| `strict`（默认推荐） | 同样三个分类任务，但每路只允许输出固定 token，追问文案交给代码生成 | 7 个分支 **7/7** 正确 |
+
+```bash
+PROMPT_VARIANT=strict python3 demo_routes.py
+```
+
+`strict` 下分类器只返回 `listing_id: XXXXXX` / `need_listing_id` / `false`（scheduling 路为 `date: ...` / `need_datetime` / `false`），
+命中"缺参数"分支时由代码输出追问句。这更贴合教程自己的主张：**LLM 只做不确定的分类抽取，确定性文案留在代码里**。
+
+⚠️ `mock_server.py` 是按 original 提示的关键字分流的，跑 mock 时必须 `PROMPT_VARIANT=original`。
+
 ### 获取 API key
 
 > 没有"开源的 API key"这回事——key 是厂商签发的身份凭证，与模型是否开源无关。这里说的是**开源/免费模型的调用额度**。
@@ -83,14 +104,16 @@ LLM_MODEL_ID=glm-4-flash
 2. **实名认证**：控制台内完成
 3. 建 key：左侧 **API 密钥** → 新建密钥（直达 https://cloud.siliconflow.cn/account/ak ）
 
-实测（2026-09-26）**实名之后仍然 402**：零价模型（`THUDM/GLM-4-9B-0414`、`THUDM/GLM-Z1-9B-0414`、`tencent/Hunyuan-MT-7B`）和 `Qwen/Qwen2.5-7B-Instruct` 全部 `402 Insufficient Balance`。
+**2026-09-26 实测：已跑通。** 光实名不够，两步都要做，缺一个就一直 402：
 
-网上流传的两个解法都不确定还有效：
+1. **领代金券**：控制台左侧 → 活动中心 / **认证专享礼** → 领 16 元代金券（180 天有效）。实名**不会自动到账**，必须手动领一次
+2. **充 0.01 元激活**：账户从未有过实盘充值余额时，代金券不生效，**连零价模型也 402**。充完立刻可用（实测充值后第一次调用就 200）
 
-- 「活动中心 → 认证专享礼」领 16 元代金券 —— **控制台里已找不到这个入口**，活动可能已下线或改名
-- 首次充值 0.01 元激活 —— 未验证，账户余额查询接口（`GET /v1/user/info`）已 410 废弃，查不了余额，只能靠实际调用反推
+**代金券不需要手动"使用"**——调用 API 产生 token 消耗时自动抵扣。扣费顺序：先扣充值余额（那 0.01 元），余额耗尽后自动从代金券扣。查看路径：账户管理 → 余额充值 → 代金券。
 
-结论：**SiliconFlow 现在等于必须充值才能用**，和 DeepSeek 一样。既然都要充，不如直接充 DeepSeek（模型更强）或走上面不用充值的智谱。平台另外两个坑：无 Mistral 系列（教程原配的 `Mistral-Small-3.2-24B` 用不了）；零价档限速 5–10 QPS + TPM 上限。
+> 余额查询接口 `GET /v1/user/info` 已 410 废弃，查不了余额，只能靠实际调用反推：200 = 有钱，402 = 没钱。
+
+平台另外两个坑：无 Mistral 系列（教程原配的 `Mistral-Small-3.2-24B` 用不了）；零价档限速 5–10 QPS + TPM 上限。
 
 #### 自检
 
@@ -161,17 +184,20 @@ python3 debug_fanout.py --ask "how much is listing 123456?"
 **现象 1：路由走到"转人工/转专员"，但用户明明在问价格**
 
 根因在 `pricing_prompt`。教程原提示要求模型**自由生成追问句**（"ask them for the listing id number"），
-同时又强调"否则只返回 `false`"，7B~14B 模型会保守地选后者。实测（SiliconFlow `Qwen/Qwen2.5-7B-Instruct`，temperature 0.1，两次采样一致）：
+同时又强调"否则只返回 `false`"，9B 级别的模型会保守地选后者。实测（SiliconFlow `THUDM/GLM-4-9B-0414`，temperature 0.1，两次采样一致）：
 
 ```
-pricing_prompt     'false'    <- 期望是追问，实际判否
+[user] Hi, can you tell me the price of one of your listings?
+pricing_prompt     'false'    <- 期望输出追问，实际判否
 scheduling_prompt  'false'
 listing_prompt     'true'     <- 于是落到 listing 分支，输出"转专员"
 ```
 
-修法：让模型只在固定 token 里三选一（`listing_id: X` / `need_listing_id` / `false`），
-追问文案由代码生成，别让模型自由发挥。教程作者用的 Mistral-Small-3.2-24B 才能扛住原提示，
-SiliconFlow 平台没有 Mistral 系列——**模型选型本身就是教程强调的迭代过程**。
+修法：切 `PROMPT_VARIANT=strict`（见「提示变体」），让模型只在固定 token 里三选一，追问文案由代码生成。
+同一模型同一批 case：`original` 5/7，`strict` 7/7。
+
+同理 `scheduling` 路也有这个毛病，需要显式声明"只要是在约时间就算预约意图，有没有日期不影响判定"，
+否则 `Can I schedule a call with an agent?` 会被判成 `false`。
 
 **现象 2：`KeyError: 'choices'`**
 
@@ -188,7 +214,7 @@ HTTP 402 {"code":30001,"message":"Sorry, your account balance is insufficient"}
 
 **现象 3：回复带前导换行**（实测 `THUDM/GLM-4-9B-0414` 返回 `'\nfalse'`）
 
-`"\nfalse" != "false"`，会被当成"命中"处理。解析前统一 `strip()`。
+`"\nfalse" != "false"`，会被当成"命中"处理。已在 `_call_single_model` 里统一 `strip()`，如自行改代码别漏掉这步。
 
 ### 工作流结构
 

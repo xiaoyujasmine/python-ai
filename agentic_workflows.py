@@ -33,12 +33,18 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 # between providers without editing SYSTEM_PROMPT_CONFIGURATIONS.
 LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "")
 
+# "original" = verbatim tutorial prompts (written for Mistral-Small-24B).
+# "strict"   = same three classifiers, but every branch answers with one
+#              fixed token instead of free-form prose. See README
+#              "排查：真实模型跑出非预期结果" for why this exists.
+PROMPT_VARIANT = os.getenv("PROMPT_VARIANT", "original").strip().lower()
+
 
 # Step 3 - Writing your prompts.
 # Each entry is an independent, stateless classification / extraction task.
 # The negative case for every prompt is the literal string "false" so the
 # routing layer in Step 5 can short-circuit with plain if/elif.
-SYSTEM_PROMPT_CONFIGURATIONS = {
+ORIGINAL_PROMPTS = {
     "pricing_prompt": {
         "model_id": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
         "prompt": "You are a customer service agent. Determine if the user's most recent request is asking about the price of a listing. If they are asking about the price of a listing AND if they have included the listing_id, return only the listing_id of the item they are asking about in the following format: 'listing_id: XXXXXX'. \nIf they are asking about the pricing of a listing AND did NOT mention the specific listing_id number, ask them for the listing id number. If they are requesting something other than the price of a listing: return only the word 'false'."
@@ -52,6 +58,56 @@ SYSTEM_PROMPT_CONFIGURATIONS = {
         "prompt": "You are a customer service agent. Determine if the user is asking a question about a listing. If they are asking a question about a listing, return only the word 'true'. Otherwise, return only the word 'false'."
     }
 }
+
+# Same three tasks, but the model is only ever allowed to emit one token from
+# a fixed set. Asking the model to BOTH free-write a follow-up question AND
+# return exactly 'false' otherwise makes small models pick 'false' every time
+# (measured: GLM-4-9B answered 'false' on an obvious pricing question, twice).
+# The follow-up wording is moved into code, where it belongs.
+STRICT_PROMPTS = {
+    "pricing_prompt": {
+        "model_id": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+        "prompt": (
+            "Classify the user's most recent request. Answer with exactly one of "
+            "these three tokens and nothing else - no punctuation, no explanation, "
+            "no markdown.\n"
+            "- 'listing_id: XXXXXX' if they are asking about the price of a listing "
+            "AND gave a listing id (copy the id they gave)\n"
+            "- 'need_listing_id' if they are asking about the price of a listing "
+            "but gave no listing id\n"
+            "- 'false' if they are not asking about the price of a listing"
+        )
+    },
+    "scheduling_prompt": {
+        "model_id": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+        "prompt": (
+            "Classify the user's most recent request. Answer with exactly one of "
+            "these three tokens and nothing else - no punctuation, no explanation, "
+            "no markdown.\n"
+            "Any request to schedule, book or arrange a call or appointment counts "
+            "as a scheduling request, whether or not a date was given.\n"
+            "- 'date: YYYY-MM-DD, time: HH:MM' if they want to schedule a call AND "
+            "gave both a date and a time\n"
+            "- 'need_datetime' if they want to schedule a call but gave no date or "
+            "no time\n"
+            "- 'false' only if the request has nothing to do with scheduling a call"
+        )
+    },
+    "listing_prompt": {
+        "model_id": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+        "prompt": (
+            "Classify the user's most recent request. Answer with exactly one of "
+            "these two tokens and nothing else - no punctuation, no explanation, "
+            "no markdown.\n"
+            "- 'true' if they are asking a question about a listing\n"
+            "- 'false' otherwise"
+        )
+    }
+}
+
+SYSTEM_PROMPT_CONFIGURATIONS = (
+    STRICT_PROMPTS if PROMPT_VARIANT == "strict" else ORIGINAL_PROMPTS
+)
 
 
 # Step 2 - Writing the asynchronous call logic.
@@ -128,7 +184,11 @@ def run_agentic_workflow(conversation_history):
 
     # Route 1: Handle pricing inquiries
     if pricing_response.lower() != "false":
-        if pricing_response.startswith("listing_id:"):
+        if pricing_response == "need_listing_id":
+            # STRICT_PROMPTS token: the classifier found a pricing intent with
+            # no id. Wording stays in code instead of being sampled from the model.
+            final_response = "Could you please provide the listing_id of the item you're asking about?"
+        elif pricing_response.startswith("listing_id:"):
             # Extract listing ID from response
             listing_id = pricing_response.split("listing_id: ")[1].strip()
 
@@ -150,7 +210,9 @@ def run_agentic_workflow(conversation_history):
 
     # Route 2: Handle scheduling requests
     elif scheduling_response.lower() != "false":
-        if scheduling_response.startswith("date:"):
+        if scheduling_response == "need_datetime":
+            final_response = "What day and time are you available for the call?"
+        elif scheduling_response.startswith("date:"):
             final_response = f"Perfect! I've scheduled a call for you on that date and time. A sales representative will reach out to you at that time."
             # In production: Add logic to actually book the appointment, and consider customizing the message to confirm the date and time selected.
         else:
