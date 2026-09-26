@@ -44,7 +44,8 @@ DigitalOcean 教程 [How to Build Parallel Agentic Workflows with Python](https:
 读的时候最容易卡住的三点，文件里都有注释标出：
 - `load_env()` **必须早于** `import agentic_workflows`（后者在模块级就把配置求值了）
 - `asyncio.run()` 不能在已运行的 event loop 里调用（常驻服务要用 async 入口）
-- `mock_server` 只认 original 提示的关键字，跑 mock 时别切 `PROMPT_VARIANT=strict`
+- `mock_server` 按提示里的关键字分流（两套变体都有这些关键字，教程版都能跑）；
+  但 prod 版的 `STRICT_TOKENS` 白名单会拦掉 mock 的自由文本追问句，跑 prod + mock 时要关掉它
 
 ### 运行
 
@@ -71,6 +72,47 @@ Response: The price for listing 123456 is $350,000.
 
 第四个变量 `PROMPT_VARIANT` 选提示集，见下方「提示变体」。
 
+### 怎么验证效果：分层测试
+
+从上往下跑，越往下越接近真实、越花钱。只想"看一眼效果"跑 L2 就够；改完代码要确认没跑偏，跑 L4+L5。
+
+| 层 | 命令 | 需要 API key | 验证什么 | 通过标准 |
+|---|---|---|---|---|
+| L0 自检 | `python check_provider.py` | ✅ | 端点可达 → key 有效 → 模型可调用（三级） | 末尾打印「自检通过」 |
+| L1 离线跑通 | 见下方「本地无 GPU / 无 API key 时跑通」 | ❌ | 并发 fan-out/fan-in + 7 个路由分支 | 7 条输出与下表一致 |
+| L2 教程场景 | `python test_workflow.py` | ✅ | 教程 Step 6 的两个场景 | 两行 `Response:` 与教程逐字一致 |
+| L3 全路由 | `python demo_routes.py` | ✅ | 7 个分支全覆盖（真实模型） | 7 条分支命中正确 |
+| L4 补强离线 | `python test_prod.py --only fault` | ❌ | 超时/重试/限流/降级/白名单等 9 项补强 | `18/18 通过` |
+| L5 补强真实 | `python test_prod.py --only real` | ✅ | prod 版 7 条路由 + 同步入口 | `8/8 通过` |
+| L6 单句排查 | `python agentic_workflows_prod.py "..." --json` | ✅ | 一句话背后的三路原始输出 | 看 `raw` 字段哪一路判错 |
+
+```bash
+python test_prod.py                # L4 + L5 全跑
+python debug_fanout.py --case 1 --repeat 3   # 同一条多采样，区分「模型抖动」还是「代码 bug」
+```
+
+**2026-09-26 实测基线**（SiliconFlow `THUDM/GLM-4-9B-0414`，`PROMPT_VARIANT=strict`）：
+L0 通过 → L2 与教程逐字一致 → L3 7/7 → L4 18/18 → L5 8/8。
+L5 单条耗时约 1.4s（三路并发），L3+L5 合计约 50 次调用，花费几分钱。
+
+L1/L3 期望的 7 条输出（`demo_routes.py` 打印的就是这张表）：
+
+| 分支 | 输入意图 | 期望回复 |
+|---|---|---|
+| pricing / 无 id | 问价但没给 listing_id | `Could you please provide the listing_id...?` |
+| pricing / 有 id | 问价且给了 `123456` | `The price for listing 123456 is $350,000.` |
+| pricing / 未知 id | 给了 `999999` | `We are unable to find that listing ID...` |
+| scheduling / 有日期 | 约电话且给了日期时间 | `Perfect! I've scheduled a call for you...` |
+| scheduling / 无日期 | 约电话但没给时间 | `What day and time are you available...?` |
+| listing | 通用房源问题 | `Please hold while I transfer you to a specialist...` |
+| fallback | 完全超纲 | `I apologize, I'm not sure how I can help...` |
+
+> **用哪个 python：** 依赖只有 `aiohttp`。在 WorkBuddy 终端里用它自带的 venv
+> （`C:\Users\xiaozeng\.workbuddy\binaries\python\envs\default\Scripts\python.exe`）直接可跑；
+> 新装的系统 Python 3.13.15 是干净的，先 `python -m pip install -r requirements.txt`
+> 或 `python -m venv venv && venv\Scripts\activate && pip install -r requirements.txt`。
+> 看到 `ModuleNotFoundError: aiohttp` 就是没装依赖，不是代码问题。
+
 ### 提示变体（真实模型必读）
 
 教程的三套提示是为 Mistral-Small-3.2-24B 写的，9B 级别的模型扛不住（实测数据见「排查」）。
@@ -88,8 +130,10 @@ PROMPT_VARIANT=strict python3 demo_routes.py
 `strict` 下分类器只返回 `listing_id: XXXXXX` / `need_listing_id` / `false`（scheduling 路为 `date: ...` / `need_datetime` / `false`），
 命中"缺参数"分支时由代码输出追问句。这更贴合教程自己的主张：**LLM 只做不确定的分类抽取，确定性文案留在代码里**。
 
-⚠️ `mock_server.py` 是按 original 提示的关键字分流的，跑 mock 时必须 `PROMPT_VARIANT=original`；
-   用 `agentic_workflows_prod.py` 跑 mock 还要加 `STRICT_TOKENS=false`（否则 mock 的自由文本追问句会被白名单拦掉）。
+`mock_server.py` 按三路提示里的关键字分流（"price of a listing" / "schedule a call" / "question about a listing"），
+这三个短语在两套变体里都有，所以**教程版跑 mock 时 `PROMPT_VARIANT` 取哪个都行**。
+唯一例外是 prod 版：它的 token 白名单（`STRICT_TOKENS=true`）会拦掉 mock 在"缺参数"分支返回的自由文本追问句
+（判为非法输出 → 落 fallback、`degraded=True`），想看追问分支就加 `STRICT_TOKENS=false`。
 
 ### 获取 API key
 

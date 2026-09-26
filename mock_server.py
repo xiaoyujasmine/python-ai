@@ -11,10 +11,15 @@
 然后把流程指过来：
     export VLLM_SERVER_URL="http://127.0.0.1:8000/v1/chat/completions"
 
-⚠️ 分流靠的是教程原文提示（ORIGINAL_PROMPTS）里的关键字
-（"price of a listing" / "schedule a call" / "question about a listing"）。
-STRICT_PROMPTS 改写过措辞，mock 认不出来，会全部返回 "false"。
-所以：**跑 mock 时必须 PROMPT_VARIANT=original**（这是默认值，别改）。
+分流靠的是三路提示里的关键字
+（"price of a listing" / "schedule a call" / "question about a listing"），
+这三个短语在 ORIGINAL_PROMPTS 和 STRICT_PROMPTS 里都存在，
+所以**教程版（test_workflow.py / demo_routes.py）两套变体都能跑 mock**，不用切。
+
+唯一要留意的是 prod 版：它多了个 token 白名单（STRICT_TOKENS=true），
+而 mock 在"缺参数"分支上返回的是自由文本追问句（不是 `need_listing_id` 这种 token），
+会被白名单判为非法输出 → 落到 fallback 且 degraded=True。
+用 prod 版跑 mock 想看追问分支时加 `STRICT_TOKENS=false` 即可。
 
 文件结构：
     fake_model_reply()         假的"模型"：按 system prompt 关键字分流，纯函数、可单测
