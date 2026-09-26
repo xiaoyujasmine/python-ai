@@ -10,6 +10,23 @@ Structure:
     Step 3 - System prompt configurations
     Step 4 - Processing user input through the models (fan-out / fan-in)
     Step 5 - Routing logic
+
+通读顺序（不要按文件从上往下读，按"数据怎么流"读）：
+    1. Step 3  SYSTEM_PROMPT_CONFIGURATIONS —— 先弄清楚模型被要求吐什么格式，
+       后面所有路由判断都是围绕这份"输出契约"展开的。
+    2. Step 2  _call_single_model / _call_models_async —— 再看这些提示怎么并发打出去。
+    3. Step 4+5 run_agentic_workflow —— 最后看 fan-out/fan-in 与 if/elif 路由。
+
+一句话数据流：
+    一条用户消息 + 三个不同的 system prompt
+      -> 三路并发各问一次模型（fan-out）
+      -> 拿到三份"分类/抽取"结果（fan-in，顺序与入参一致）
+      -> 按 pricing > scheduling > listing > fallback 的优先级挑一条
+      -> 返回一句给用户的回复
+
+核心设计取舍：三次调用之间没有依赖，所以能并发；分类结果被压缩成极短的
+token（'false' / 'listing_id: XXXXXX' / 'date: ...'），所以路由层能用最土的
+if/elif 搞定，不需要再调一次模型去判断意图。
 """
 
 import asyncio
@@ -105,18 +122,29 @@ STRICT_PROMPTS = {
     }
 }
 
+# 上面两套提示的"开关"。教程原版写死用 ORIGINAL_PROMPTS；这里加了个开关，
+# 是因为把原提示搬到 9B 级别的小模型上会误判（详见 STRICT_PROMPTS 上方的说明）。
+# 注意：import 时就求值，所以 PROMPT_VARIANT 必须在 import 之前设好（见 env_loader）。
 SYSTEM_PROMPT_CONFIGURATIONS = (
     STRICT_PROMPTS if PROMPT_VARIANT == "strict" else ORIGINAL_PROMPTS
 )
 
 
+# ---------------------------------------------------------------------------
 # Step 2 - Writing the asynchronous call logic.
+#
+# 这一层的职责只有一个：把一条 messages 发到 OpenAI 兼容端点，取回模型那句回答。
+# 它是"单次调用"，不知道路由、不知道并发，也刻意不做重试/超时 —— 那是
+# agentic_workflows_prod.py 的事。先理解这个极简版，再看 prod 版补了什么。
+# ---------------------------------------------------------------------------
 
 async def _call_single_model(call_spec):
     """Make an async call to the Digital Ocean GPU droplet with a given model and messages"""
     model_id = call_spec["model_id"]
     messages = call_spec["messages"]
 
+    # OpenAI 兼容的请求体。max_tokens=100 是因为分类结果本来就该很短；
+    # temperature=0.1 是压低随机性，分类任务不想要"创意"。
     payload = {
         "model": model_id,
         "messages": messages,
@@ -125,13 +153,18 @@ async def _call_single_model(call_spec):
     }
 
     headers = {"Content-Type": "application/json"}
+    # key 为空时（自建 vLLM / 本地 mock）不发 Authorization 头，否则部分网关会 401
     if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
 
+    # 每次调用都新建 session = 每次都重建 TCP 连接和连接池。
+    # demo 无所谓，线上会白白多出一轮 TLS/握手开销（prod 版把 session 提到外层复用）。
     async with aiohttp.ClientSession() as session:
+        # 没有 timeout：端点挂起时这里会一直等下去。prod 版补了 ClientTimeout。
         async with session.post(VLLM_SERVER_URL, json=payload, headers=headers) as response:
-            result = await response.json()
+            result = await response.json()  # 非 2xx 时这里拿到的是错误体，会被当成正常解析
 
+            # OpenAI 的响应结构：choices[0].message.content 才是模型说的话
             message = result["choices"][0]["message"]["content"]
             # Real models routinely emit a leading newline ("\nfalse") or wrap
             # output in markdown. Without this strip, "\nfalse" != "false" and
@@ -141,26 +174,42 @@ async def _call_single_model(call_spec):
 
 async def _call_models_async(call_list):
     """Call multiple models asynchronously and return responses in the same order"""
-    # Create tasks for all model calls
+    # 这里只是把协程"打包"成 Task 并排进事件循环，此刻还没有真正发起请求
     tasks = [_call_single_model(call_spec) for call_spec in call_list]
 
-    # Run all tasks concurrently and return responses in order
+    # gather 的两个关键性质：
+    #   1. 并发 —— 三路请求同时在飞，总耗时 ≈ 最慢的那一路，而不是三路之和
+    #   2. 保序 —— 返回的 list 与 tasks 顺序严格一致，所以不需要按 prompt 名回查
+    #              就能把结果对回各自的提示（Step 4 就是靠这一点做映射的）
+    # 另：默认 return_exceptions=False，任意一路抛异常会直接把整个 gather 炸掉。
     responses = await asyncio.gather(*tasks)
     return responses
 
 
 def call_models(call_list):
     """Synchronous wrapper around the async fan-out. Do not call this from
-    inside a running event loop (use `_call_models_async` directly instead)."""
+    inside a running event loop (use `_call_models_async` directly instead).
+
+    asyncio.run() 会新建一个事件循环并在结束后关掉它，所以：
+      - 脚本里可以直接用（本文件就是这么用的）
+      - FastAPI / 常驻服务里不能用（那里已经有一个在跑的 loop，会 RuntimeError）
+    """
     return asyncio.run(_call_models_async(call_list))
 
 
+# ---------------------------------------------------------------------------
 # Step 4 + Step 5 - Processing user input through the models, then routing.
+#
+# fan-out：把同一段会话历史分别套上三个不同的 system prompt，一次并发发出去。
+# fan-in ：把三份结果按序收回，再用 if/elif 按优先级挑一条分支。
+# ---------------------------------------------------------------------------
 
 def run_agentic_workflow(conversation_history):
     model_calls_list = []
     prompt_names = []  # Keep track of prompt order for response mapping
 
+    # fan-out 的组装阶段：每个 prompt 一路，消息体 = [system prompt] + 完整会话历史。
+    # 注意三路拿到的是同一份历史，只是 system prompt 不同 —— 这是"并行分类"的全部秘密。
     for prompt_name, config in SYSTEM_PROMPT_CONFIGURATIONS.items():
         # LLM_MODEL_ID (if set) overrides the per-prompt model for all prompts
         model_id = LLM_MODEL_ID or config["model_id"]
@@ -175,12 +224,23 @@ def run_agentic_workflow(conversation_history):
         })
         prompt_names.append(prompt_name)
 
+    # fan-in：一次并发拿回三份结果（阻塞直到全部完成）
     prompt_responses = call_models(model_calls_list)
 
-    # Map responses to their respective prompts
+    # 用名字回查下标，而不是写死 [0] [1] [2]：
+    # 这样往 SYSTEM_PROMPT_CONFIGURATIONS 里加/删提示时不会静默错位。
     pricing_response = prompt_responses[prompt_names.index("pricing_prompt")]
     scheduling_response = prompt_responses[prompt_names.index("scheduling_prompt")]
     listing_response = prompt_responses[prompt_names.index("listing_prompt")]
+
+    # 路由的通用约定：模型返回 "false" = "这条不是我的事"，于是落到下一路；
+    # 返回别的任何东西 = "这条归我"，进入本路的处理分支。
+    # 优先级是写死的：pricing > scheduling > listing > fallback，改顺序就改语义。
+    #
+    # ⚠️ 下面每路最后都有一个 else 兜底"原样透出模型输出"。教程里这是"让模型
+    # 自己生成追问句"的设计；放到生产有风险 —— 模型跑偏时（实测 GLM-4-9B 在
+    # scheduling 路吐过一整段 "I'm sorry, but I don't have access to..."），
+    # 那段话会被原封不动发给用户。prod 版用 token 白名单把这条堵上了。
 
     # Route 1: Handle pricing inquiries
     if pricing_response.lower() != "false":

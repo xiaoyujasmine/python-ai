@@ -1,16 +1,25 @@
 """
-Minimal OpenAI-compatible mock server so the workflow can be run locally
-without a GPU Droplet or a third-party LLM API.
+零依赖的 OpenAI 兼容假端点：没有 GPU、没有 API key 也能把整条链路跑通。
 
-It inspects the incoming system prompt and returns the kind of reply the
-real model is instructed to produce, which is enough to exercise the
-fan-out / fan-in and routing logic end to end.
+它的"智能"只有一层正则：看一眼传进来的 system prompt 属于哪一路，
+然后按那一路的输出契约编一句回答。对验证 fan-out / fan-in / 路由来说够用了 ——
+反正我们要测的是编排逻辑，不是模型能力。
 
-Usage:
+用法：
     python3 mock_server.py [--port 8000] [--verbose]
 
-Then point the workflow at it:
+然后把流程指过来：
     export VLLM_SERVER_URL="http://127.0.0.1:8000/v1/chat/completions"
+
+⚠️ 分流靠的是教程原文提示（ORIGINAL_PROMPTS）里的关键字
+（"price of a listing" / "schedule a call" / "question about a listing"）。
+STRICT_PROMPTS 改写过措辞，mock 认不出来，会全部返回 "false"。
+所以：**跑 mock 时必须 PROMPT_VARIANT=original**（这是默认值，别改）。
+
+文件结构：
+    fake_model_reply()         假的"模型"：按 system prompt 关键字分流，纯函数、可单测
+    ChatCompletionsHandler     HTTP 层：收 POST、调上面那个函数、按 OpenAI 格式包回去
+    main()                     起 http.server
 """
 
 import argparse
@@ -22,16 +31,21 @@ VERBOSE = False
 
 
 def fake_model_reply(messages):
-    """Stand-in for the real model: classify + extract, following each prompt's contract."""
+    """假的模型：按 system prompt 判断自己是哪一路，再按该路的输出契约编回答。
+
+    多路分类之所以能并发，就是因为每路只看 system prompt + 会话历史。
+    这里用关键字判断"我是哪一路"，等价于真模型读 system prompt 后的自我定位。
+    """
     system = messages[0]["content"] if messages and messages[0]["role"] == "system" else ""
 
+    # 分类只看"最近一条用户消息"，和真提示里写的一样
     last_user = ""
     for message in reversed(messages):
         if message["role"] == "user":
             last_user = message["content"]
             break
 
-    # pricing_prompt -> 'listing_id: XXXXXX' | clarifying question | 'false'
+    # pricing_prompt -> 'listing_id: XXXXXX' | 追问句 | 'false'
     if "price of a listing" in system:
         match = re.search(r"\b(\d{6})\b", last_user)
         if match:
@@ -40,7 +54,7 @@ def fake_model_reply(messages):
             return "Could you please provide the listing_id of the item you're asking about?"
         return "false"
 
-    # scheduling_prompt -> 'date: YYYY-MM-DD, time: HH:MM' | clarifying question | 'false'
+    # scheduling_prompt -> 'date: YYYY-MM-DD, time: HH:MM' | 追问句 | 'false'
     if "schedule a call" in system:
         if not any(word in last_user.lower() for word in ("call", "schedule", "appointment", "meeting")):
             return "false"
@@ -57,18 +71,21 @@ def fake_model_reply(messages):
 
 
 class ChatCompletionsHandler(BaseHTTPRequestHandler):
+    """只认 POST /v1/chat/completions（路径不看，端口上来的都当这个接口处理）。"""
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
         except json.JSONDecodeError:
-            body = {}
+            body = {}  # 坏请求也照常回一句，方便测客户端的容错
 
         content = fake_model_reply(body.get("messages", []))
         if VERBOSE:
             model = body.get("model", "-")
             print(f"[{model}] -> {content!r}", flush=True)
 
+        # 严格按 OpenAI 的响应结构拼，客户端才能用同一套解析代码
         payload = {
             "id": "chatcmpl-mock",
             "object": "chat.completion",

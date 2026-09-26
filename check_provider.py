@@ -1,10 +1,16 @@
 """
-Connectivity / quota self-check before running the workflow.
+跑流程之前的三级自检。换端点、换 key、换模型之后先跑它，别一上来就调 workflow
+—— 否则报错会和"提示写得烂""路由写错了"混在一起，排查成本翻倍。
 
-Verifies three things in order:
-    1. the endpoint is reachable and the API key is accepted (GET /models)
-    2. the chosen model exists and is callable
-    3. a real classification reply comes back in the expected shape
+按依赖顺序查三级，任何一级挂了后面的就不用看了：
+    1. 端点可达 + key 被接受        GET /models
+    2. 目标模型存在                （拿到的列表里有没有 LLM_MODEL_ID）
+    3. 模型真的能按格式回答         发一句 "Return only the word 'false'."
+
+最常见的两类失败，处理方式完全相反，别搞混：
+    401  key 无效/没传      -> 重新配 LLM_API_KEY
+    402  key 有效但没余额   -> 充值或领额度，**重建 key 没有任何用**
+（402 是最容易白折腾的一个：key 明明是好的，只是账户里没钱。）
 
 Usage:
     export VLLM_SERVER_URL="https://api.siliconflow.cn/v1/chat/completions"

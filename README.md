@@ -21,6 +21,31 @@ DigitalOcean 教程 [How to Build Parallel Agentic Workflows with Python](https:
 | `debug_fanout.py` | 打印每条路由决策背后的三路原始输出，定位是哪一路判错 |
 | `.env.example` | 配置模板，复制为 `.env` 后填写；`.env` 已在 `.gitignore` 中 |
 
+### 通读顺序
+
+不要按文件名顺序读，按"数据怎么流"读，两遍就能通：
+
+**第一遍：把链路跑通（只看教程版，30 分钟）**
+
+| 顺序 | 看什么 | 目的 |
+|---|---|---|
+| 1 | `agentic_workflows.py` 的 `ORIGINAL_PROMPTS` | 先搞清模型被要求吐什么格式 —— 后面所有路由判断都是围绕这份输出契约 |
+| 2 | `_call_single_model` → `_call_models_async` | 再看这些提示怎么并发打出去（`gather` 的并发 + 保序两个性质） |
+| 3 | `run_agentic_workflow` | 最后看 fan-out 组装、fan-in 归集、if/elif 优先级路由 |
+| 4 | `mock_server.py` + `demo_routes.py` | 不要 key 跑一遍，把 7 个分支走通，建立直觉 |
+
+**第二遍：看生产化补了什么（对照着读）**
+
+`agentic_workflows_prod.py` 的函数调用链已在文件头画出，照着走一遍即可。
+每一处补强都对应 `test_prod.py` 里的一条故障注入断言（用例名就是补强项）：
+429 重试、持续 500 降级、单路失败跳过、超时熔断、坏 JSON 不重试、
+脏输出归一化、白名单拦跑偏文本、并发峰值 1/2/3。
+
+读的时候最容易卡住的三点，文件里都有注释标出：
+- `load_env()` **必须早于** `import agentic_workflows`（后者在模块级就把配置求值了）
+- `asyncio.run()` 不能在已运行的 event loop 里调用（常驻服务要用 async 入口）
+- `mock_server` 只认 original 提示的关键字，跑 mock 时别切 `PROMPT_VARIANT=strict`
+
 ### 运行
 
 ```bash

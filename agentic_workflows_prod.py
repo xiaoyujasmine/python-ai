@@ -19,6 +19,23 @@ demo 里没问题，放到线上会有六个具体的失效模式，本文件逐
       "Answer: false"，教程里只做 strip() 是不够的。
     - 价格查询从函数里抽出来，可注入真实 DB 查询，不再硬编码字典。
 
+怎么读这个文件（建议按调用链自底向上，或自顶向下各读一遍）：
+
+    run_agentic_workflow()          <- 入口（同步包装，脚本/测试用）
+      └─ run_agentic_workflow_async()   <- 真正的主流程，读这一个就懂全貌
+           ├─ build_call_specs()    组装三路请求（= 教程 Step 4 的 fan-out 准备）
+           ├─ fanout()              并发发出去，返回 {prompt名: 文本 or 异常}
+           │    └─ call_model_once()  单路：限流 -> 超时 -> 分诊 -> 重试
+           │         └─ _attempt()      真正的 HTTP POST
+           ├─ normalize() + sanitize_token()   把模型输出压成可信 token
+           └─ route()                按优先级挑分支（= 教程 Step 5）
+
+    排障时看 RouteDecision 的四个字段就够了：
+        route     最终走了哪条分支
+        raw       三路各自归一化后的原文（看模型到底说了什么）
+        errors    哪一路失败、为什么
+        degraded  True 表示结果是"带病"产出的，不该当正常样本评估
+
 用法（与教程版接口兼容，多一个结构化返回值）：
     result = run_agentic_workflow(history)
     print(result.reply)        # 教程版的那个字符串
@@ -535,6 +552,10 @@ async def run_agentic_workflow_async(
         if owns_session:
             await session.close()
 
+    # fan-in 归集：把每路结果分成"可用文本"和"失败原因"两堆。
+    # 这里是整个 prod 版与教程版最本质的差别 —— 教程版假设三路必定都成功，
+    # 这里承认任何一路都可能失败，并且失败时只是"这一路当作没命中"，
+    # 而不是让整条请求崩掉。
     responses: Dict[str, str] = {}
     errors: Dict[str, str] = {}
     degraded = False
