@@ -45,13 +45,29 @@ Response: The price for listing 123456 is $350,000.
 
 > 没有"开源的 API key"这回事——key 是厂商签发的身份凭证，与模型是否开源无关。这里说的是**开源/免费模型的调用额度**。
 
-#### DeepSeek（当前默认）
+#### 智谱 BigModel（唯一实测不用充值的，推荐先走这条）
+
+1. 注册：打开 https://open.bigmodel.cn ，手机号注册
+2. **实名认证**：控制台内完成（与 SiliconFlow 的实名不通用，两家各认一次）
+3. 建 key：左侧 **API Keys** → 新建 → 复制 `sk-` 开头那串（只显示一次）
+4. 填进 `.env`：
+
+```bash
+VLLM_SERVER_URL=https://open.bigmodel.cn/api/paas/v4/chat/completions
+LLM_API_KEY=sk-你的key
+LLM_MODEL_ID=glm-4-flash
+```
+
+`glm-4-flash` 系（`glm-4-flash` / `glm-4.7-flash`）是官方承诺的**永久免费**模型，注册后无需充值即可调用。限流约 3 req/s（单模型并发 1），跑本 demo 够用。
+
+#### DeepSeek（当前默认，需充值）
 
 1. 注册：打开 https://platform.deepseek.com ，手机号或微信登录
 2. 建 key：左侧 **API keys** → **Create new key** → 复制 `sk-` 开头那串
    - **只显示一次**，关掉弹窗就找不回来了
 3. **充值**：DeepSeek **没有免费额度**，余额为 0 时所有模型一律 `402 Insufficient Balance`
    - 查余额：`GET https://api.deepseek.com/user/balance`
+   - `deepseek-flash` 极便宜，充 10 元够高强度跑很久
 4. 填进 `.env`：`LLM_API_KEY=sk-你的key`
 
 可用模型（2026-09 实测 `/v1/models`，老的 `deepseek-chat` / `deepseek-reasoner` **已下架**）：
@@ -61,21 +77,20 @@ Response: The price for listing 123456 is $350,000.
 | `deepseek-flash` | DeepSeek-V4.1-Flash，1M 上下文，便宜，跑本 demo 用这个 |
 | `deepseek-v4-pro` | 更强更贵 |
 
-#### 硅基流动 SiliconFlow（备用）
+#### 硅基流动 SiliconFlow（已踩坑，不推荐优先试）
 
 1. 注册：打开 https://cloud.siliconflow.cn ，手机号验证码或 GitHub 登录
-2. **实名认证**：控制台内完成，未实名领不到免费额度（国内平台合规要求），无实名时调用报 `402`
-3. 领额度：账户中心 → 资源包，注册赠送的 token 在此确认到账
-4. 建 key：左侧 **API 密钥** → **新建密钥** → 复制 `sk-` 开头那串
-   - 直达链接：https://cloud.siliconflow.cn/account/ak
-5. 填进 `.env`，并把端点换成 `https://api.siliconflow.cn/v1/chat/completions`
+2. **实名认证**：控制台内完成
+3. 建 key：左侧 **API 密钥** → 新建密钥（直达 https://cloud.siliconflow.cn/account/ak ）
 
-实测（2026-09-26）**实名之后仍然 402**，零价模型（`THUDM/GLM-4-9B-0414`、`THUDM/GLM-Z1-9B-0414`、`tencent/Hunyuan-MT-7B`）也一样。原因是漏了两步：
+实测（2026-09-26）**实名之后仍然 402**：零价模型（`THUDM/GLM-4-9B-0414`、`THUDM/GLM-Z1-9B-0414`、`tencent/Hunyuan-MT-7B`）和 `Qwen/Qwen2.5-7B-Instruct` 全部 `402 Insufficient Balance`。
 
-1. **手动领券**：活动中心 → **认证专享礼** → 领取代金券（约 16 元）。实名完成**不会自动到账**
-2. **首次充值激活**：充 0.01 元。账户从未有过实盘充值余额时，代金券不生效，连零价模型也 402
+网上流传的两个解法都不确定还有效：
 
-零价档限速约 5–10 QPS 且有 TPM 上限，超了返回 429。平台**没有 Mistral 系列**，教程原配的 `Mistral-Small-3.2-24B` 用不了。
+- 「活动中心 → 认证专享礼」领 16 元代金券 —— **控制台里已找不到这个入口**，活动可能已下线或改名
+- 首次充值 0.01 元激活 —— 未验证，账户余额查询接口（`GET /v1/user/info`）已 410 废弃，查不了余额，只能靠实际调用反推
+
+结论：**SiliconFlow 现在等于必须充值才能用**，和 DeepSeek 一样。既然都要充，不如直接充 DeepSeek（模型更强）或走上面不用充值的智谱。平台另外两个坑：无 Mistral 系列（教程原配的 `Mistral-Small-3.2-24B` 用不了）；零价档限速 5–10 QPS + TPM 上限。
 
 #### 自检
 
@@ -191,7 +206,7 @@ conversation_history
 
 ### 接入真实模型
 
-默认走 DeepSeek：国内直连（已实测本机无需代理）、OpenAI 兼容。备选 SiliconFlow（9B 以下免费）、智谱、百炼、OpenRouter，都在 `.env.example` 里。
+默认走 DeepSeek：国内直连（已实测本机无需代理）、OpenAI 兼容，但**必须充值**。备选智谱（`glm-4-flash` 永久免费，不用充值）、SiliconFlow、百炼、OpenRouter，都在 `.env.example` 里。
 
 **1. 拿 key**：见上一节。
 
@@ -222,12 +237,14 @@ python3 test_workflow.py      # 教程的两个场景
 
 | 平台 | 免费额度 | 端点 |
 |---|---|---|
-| 智谱 AI | 2000 万 token + GLM-4-Flash 永久免费，30 并发 | `https://open.bigmodel.cn/api/paas/v4/chat/completions` |
-| 阿里云百炼 | 7000 万 token，覆盖 70+ 模型 | `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions` |
+| **智谱 AI** | `glm-4-flash` 系永久免费，注册+实名即可用（2026-09 唯一实测不用充值的） | `https://open.bigmodel.cn/api/paas/v4/chat/completions` |
+| 阿里云百炼 | 新用户各模型约 100 万 token（限期） | `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions` |
+| 魔搭 ModelScope | 2000 req/天，需绑阿里云账号+实名 | `https://api-inference.modelscope.cn/v1/chat/completions` |
 | OpenRouter | 25+ 免费模型（ID 带 `:free` 后缀），约 200 req/天 | `https://openrouter.ai/api/v1/chat/completions` |
 | Groq / Cerebras | 速度快、按 RPM 限额 | 各平台 `/v1/chat/completions` |
 
-后两家部分地区需要代理。
+OpenRouter、Groq、Cerebras 部分地区需要代理。
+SiliconFlow 未列入：实名后实测仍 402，实际等同必须充值（详见上文）。
 
 环境变量说明：
 
