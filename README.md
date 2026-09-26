@@ -15,6 +15,8 @@ DigitalOcean 教程 [How to Build Parallel Agentic Workflows with Python](https:
 | `mock_server.py` | 本地 mock 推理端点（仅用标准库），无 GPU / 无 API key 也能跑通全流程 |
 | `demo_routes.py` | 遍历路由层的全部 7 个分支，验证 fan-out / fan-in 与短路判定 |
 | `check_provider.py` | 接入真实厂商前的自检：端点可达性、key 有效性、模型可调用性 |
+| `env_loader.py` | 零依赖 `.env` 加载器（不引入 python-dotenv），命令行 export 的值优先 |
+| `.env.example` | 配置模板，复制为 `.env` 后填写；`.env` 已在 `.gitignore` 中 |
 
 ### 运行
 
@@ -23,8 +25,8 @@ python3 -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# 指向你的 OpenAI 兼容端点（自建 vLLM / 第三方 API 均可）
-export VLLM_SERVER_URL="http://your_server_ip:8000/v1/chat/completions"
+cp .env.example .env              # 填 VLLM_SERVER_URL / LLM_API_KEY / LLM_MODEL_ID
+# 也可以不建 .env，直接 export（export 优先级高于 .env）
 
 python3 test_workflow.py
 ```
@@ -36,7 +38,41 @@ Response: Could you please provide the listing_id of the item you're asking abou
 Response: The price for listing 123456 is $350,000.
 ```
 
-不设 `VLLM_SERVER_URL` 时，代码回落到教程中的占位地址 `http://your_server_ip:8000/v1/chat/completions`，需自行替换。
+配置读取顺序：**命令行 export > `.env` > 代码默认值**（`http://your_server_ip:8000/v1/chat/completions`，需自行替换）。
+三个入口脚本（`test_workflow.py` / `demo_routes.py` / `check_provider.py`）启动时都会自动加载 `.env`，无需反复 export。
+
+### 获取 SiliconFlow API key
+
+> 没有"开源的 API key"这回事——key 是厂商签发的身份凭证，与模型是否开源无关。这里说的是**开源/免费模型的免费调用额度**。
+
+1. 注册：打开 https://cloud.siliconflow.cn ，手机号验证码或 GitHub 登录
+2. **实名认证**：控制台内完成，未实名领不到免费额度（国内平台合规要求）
+3. 领额度：账户中心 → 资源包，注册赠送的 token 在此确认到账
+4. 建 key：左侧 **API 密钥** → **新建密钥** → 复制 `sk-` 开头那串
+   - 直达链接：https://cloud.siliconflow.cn/account/ak
+   - **只显示一次**，关掉弹窗就找不回来了，立刻存好
+5. 填进 `.env`：`LLM_API_KEY=sk-你的key`
+
+然后自检：
+
+```bash
+python3 check_provider.py     # 端点 -> key -> 模型，逐级验证
+python3 demo_routes.py        # 7 个路由分支
+```
+
+自检输出示例（key 还没填时会这样）：
+
+```
+[env] 已加载 .../python-ai/.env（3 项）；命令行 export 的值优先
+endpoint : https://api.siliconflow.cn/v1/chat/completions
+api key  : 未设置（本地无鉴权模式）
+model    : Qwen/Qwen2.5-7B-Instruct
+
+[WARN] GET https://api.siliconflow.cn/v1/models 不可用 -> HTTP 401: {"code":30014,...,"message":"Token is invalid."}
+[FAIL] HTTP 401：API key 无效或未设置（LLM_API_KEY 当前长度 0）
+```
+
+**免费档注意**：9B 以下模型永久免费，但限速约 5–10 QPS 且有 TPM 上限，超了返回 429。`demo_routes.py` 一次跑 7 个 case × 3 次并发 = 21 次调用，密集跑容易撞线——撞了就歇一分钟，或改用付费档。
 
 ### 本地无 GPU / 无 API key 时跑通
 

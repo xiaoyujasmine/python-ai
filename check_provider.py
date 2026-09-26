@@ -20,6 +20,11 @@ import sys
 
 import aiohttp
 
+from env_loader import load_env_verbose
+
+# 必须在读取下面三个配置之前执行：模块级常量只在 import 时求值一次
+load_env_verbose()
+
 VLLM_SERVER_URL = os.getenv("VLLM_SERVER_URL", "http://your_server_ip:8000/v1/chat/completions")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "") or "Qwen/Qwen2.5-7B-Instruct"

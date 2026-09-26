@@ -10,6 +10,11 @@ Both scenarios from the tutorial are executed in one pass:
        resolve it against the example price database.
 """
 
+from env_loader import load_env_verbose
+
+# 先加载 .env，再 import agentic_workflows（后者在模块级读取端点/模型配置）
+load_env_verbose()
+
 from agentic_workflows import run_agentic_workflow
 
 
