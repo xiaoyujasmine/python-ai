@@ -70,7 +70,12 @@ Response: The price for listing 123456 is $350,000.
    - 直达链接：https://cloud.siliconflow.cn/account/ak
 5. 填进 `.env`，并把端点换成 `https://api.siliconflow.cn/v1/chat/completions`
 
-9B 以下模型永久免费（`Qwen/Qwen2.5-7B-Instruct` 等），但限速约 5–10 QPS 且有 TPM 上限，超了返回 429。平台**没有 Mistral 系列**，教程原配的 `Mistral-Small-3.2-24B` 用不了。
+实测（2026-09-26）**实名之后仍然 402**，零价模型（`THUDM/GLM-4-9B-0414`、`THUDM/GLM-Z1-9B-0414`、`tencent/Hunyuan-MT-7B`）也一样。原因是漏了两步：
+
+1. **手动领券**：活动中心 → **认证专享礼** → 领取代金券（约 16 元）。实名完成**不会自动到账**
+2. **首次充值激活**：充 0.01 元。账户从未有过实盘充值余额时，代金券不生效，连零价模型也 402
+
+零价档限速约 5–10 QPS 且有 TPM 上限，超了返回 429。平台**没有 Mistral 系列**，教程原配的 `Mistral-Small-3.2-24B` 用不了。
 
 #### 自检
 
