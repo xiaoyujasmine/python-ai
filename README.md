@@ -107,6 +107,48 @@ python3 demo_routes.py       # 7 个分支全覆盖
   -> I apologize, I'm not sure how I can help with that. Let me transfer you to a human representative who can better assist you.
 ```
 
+### 排查：真实模型跑出非预期结果
+
+先看 fan-out 的三路原始输出，路由代码本身极少出错：
+
+```bash
+python3 debug_fanout.py --case 1            # 打印 pricing/scheduling/listing 三路原始回复
+python3 debug_fanout.py --case 1 --repeat 3 # 多次采样，看是否稳定
+python3 debug_fanout.py --ask "how much is listing 123456?"
+```
+
+**现象 1：路由走到"转人工/转专员"，但用户明明在问价格**
+
+根因在 `pricing_prompt`。教程原提示要求模型**自由生成追问句**（"ask them for the listing id number"），
+同时又强调"否则只返回 `false`"，7B~14B 模型会保守地选后者。实测（SiliconFlow `Qwen/Qwen2.5-7B-Instruct`，temperature 0.1，两次采样一致）：
+
+```
+pricing_prompt     'false'    <- 期望是追问，实际判否
+scheduling_prompt  'false'
+listing_prompt     'true'     <- 于是落到 listing 分支，输出"转专员"
+```
+
+修法：让模型只在固定 token 里三选一（`listing_id: X` / `need_listing_id` / `false`），
+追问文案由代码生成，别让模型自由发挥。教程作者用的 Mistral-Small-3.2-24B 才能扛住原提示，
+SiliconFlow 平台没有 Mistral 系列——**模型选型本身就是教程强调的迭代过程**。
+
+**现象 2：`KeyError: 'choices'`**
+
+模型调用失败了（余额不足、限流、模型名写错），教程代码没检查 HTTP 状态就直接取字段。
+先把原始错误体打出来：
+
+```
+HTTP 402 {"code":30001,"message":"Sorry, your account balance is insufficient"}
+```
+
+- `402` 余额不足：只有 9B 以下模型在免费档；14B/32B/72B 都要付费额度。去控制台实名认证领赠送额度，或充值
+- `401` / `code 30014` key 无效或没填
+- `429` 触发限流（免费档约 5–10 QPS + TPM 上限），歇一分钟再跑
+
+**现象 3：回复带前导换行**（实测 `THUDM/GLM-4-9B-0414` 返回 `'\nfalse'`）
+
+`"\nfalse" != "false"`，会被当成"命中"处理。解析前统一 `strip()`。
+
 ### 工作流结构
 
 ```
