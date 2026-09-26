@@ -16,6 +16,9 @@ DigitalOcean 教程 [How to Build Parallel Agentic Workflows with Python](https:
 | `demo_routes.py` | 遍历路由层的全部 7 个分支，验证 fan-out / fan-in 与短路判定 |
 | `check_provider.py` | 接入真实厂商前的自检：端点可达性、key 有效性、模型可调用性 |
 | `env_loader.py` | 零依赖 `.env` 加载器（不引入 python-dotenv），命令行 export 的值优先 |
+| `agentic_workflows_prod.py` | **生产化版**：超时/重试/限流/降级/结构化输出，教程原文件不动 |
+| `test_prod.py` | 生产化补强的回归测试：本地故障注入（离线）+ 真实端点路由 |
+| `debug_fanout.py` | 打印每条路由决策背后的三路原始输出，定位是哪一路判错 |
 | `.env.example` | 配置模板，复制为 `.env` 后填写；`.env` 已在 `.gitignore` 中 |
 
 ### 运行
@@ -60,7 +63,8 @@ PROMPT_VARIANT=strict python3 demo_routes.py
 `strict` 下分类器只返回 `listing_id: XXXXXX` / `need_listing_id` / `false`（scheduling 路为 `date: ...` / `need_datetime` / `false`），
 命中"缺参数"分支时由代码输出追问句。这更贴合教程自己的主张：**LLM 只做不确定的分类抽取，确定性文案留在代码里**。
 
-⚠️ `mock_server.py` 是按 original 提示的关键字分流的，跑 mock 时必须 `PROMPT_VARIANT=original`。
+⚠️ `mock_server.py` 是按 original 提示的关键字分流的，跑 mock 时必须 `PROMPT_VARIANT=original`；
+   用 `agentic_workflows_prod.py` 跑 mock 还要加 `STRICT_TOKENS=false`（否则 mock 的自由文本追问句会被白名单拦掉）。
 
 ### 获取 API key
 
@@ -278,11 +282,78 @@ SiliconFlow 未列入：实名后实测仍 402，实际等同必须充值（详�
 - `LLM_MODEL_ID` 设置了就覆盖所有提示的模型；不设则各提示用自己配置的 `model_id`
 - **key 只放环境变量或 `.env`**（已在 `.gitignore` 中），不要写进代码或提交到 git
 
-### 生产化补强（教程未覆盖）
+### 生产化补强（`agentic_workflows_prod.py`）
 
-1. `asyncio.gather(..., return_exceptions=True)` + `aiohttp.ClientTimeout`，避免单次失败/超时拖垮整批
-2. `asyncio.Semaphore(n)` 限流，防止打爆自建 vLLM 或触发第三方 RPM 限制
-3. 用 JSON mode / structured output 替代 `startswith("listing_id:")` 这类脆弱的字符串解析
-4. `ClientSession` 提到外层复用连接池（当前每次调用都新建 session）
-5. `call_models()` 用 `asyncio.run()` 包壳，Web 服务中应直接 `await _call_models_async()`
-6. 记录每个提示的耗时、token 与命中率，逐提示迭代优化
+教程版 `agentic_workflows.py` 刻意保持极简，下面这些是它上到真实端点会踩的坑，已在 **`agentic_workflows_prod.py`** 逐个补掉。
+教程原文件不动，两套提示保持单一来源（prod 版直接 `import` 教程模块的 `SYSTEM_PROMPT_CONFIGURATIONS`）。
+
+| # | 教程版做法 | 线上会怎样 | prod 版做法 |
+|---|---|---|---|
+| 1 | 每次调用新建 `ClientSession` | 连接池反复重建 | 一次 fan-out 共用一个 session；常驻服务可传入复用 |
+| 2 | 无 timeout | 端点挂起 → 请求永久卡死 | `ClientTimeout`(connect 5s / sock_read 15s / total 20s) |
+| 3 | 无重试 | 429 / 5xx 抖动直接失败 | 指数退避 + 抖动重试，尊重 `Retry-After`，默认最多 3 次尝试 |
+| 4 | 不区分错误 | 401 / 402 也跟着重试，白烧时间和钱 | 按状态码分诊：401/402/403/400/404 **fail fast**，只有 408/429/5xx 重试 |
+| 5 | 三路全并发 | 打爆免费档 QPS（上一节那条 429 警告） | `asyncio.Semaphore`，`MAX_CONCURRENCY` 默认 3 |
+| 6 | `gather` 不接异常 | 一路挂 → 整个 fan-out 崩 | `return_exceptions=True` + 该路降级为"未命中"，其余分支照常判定 |
+| 7 | 只返回一段字符串 | 出问题没法排障 | 返回 `RouteDecision`：`route` / `matched_prompt` / `raw` / `errors` / `degraded` / `elapsed_ms` |
+| 8 | `startswith()` 解析 | `\nfalse`、`**false**`、尾随解释全部误判命中 | `normalize()` 归一化 + strict token 白名单 |
+| 9 | 同步 `call_models()` 包壳 | Web 服务里 `asyncio.run()` 嵌套直接报错 | 同步/异步双入口，async 版可在已有 loop 中 `await` |
+
+第 8 点的白名单不是洁癖：路由层里 pricing / scheduling 各有一个"原样透出"的兜底分支，
+模型跑偏时吐出的长文本会被当成追问句直接发给用户。实测抓到过一次
+（GLM-4-9B 在 scheduling 路上返回 "I'm sorry, but I don't have access to real-time data ..."），
+开白名单后该路按未命中处理，落到真正命中的分支。
+
+**用法**
+
+```python
+from agentic_workflows_prod import run_agentic_workflow
+
+decision = run_agentic_workflow(history)
+decision.reply        # 教程版那个字符串
+decision.route        # pricing / scheduling / listing / fallback
+decision.degraded     # True = 有分类路失败或输出非法，结果是降级出来的
+
+# 已有 event loop（FastAPI 等常驻服务）：用 async 入口并复用 session
+decision = await run_agentic_workflow_async(history, session=session)
+
+# 价格查询可注入真实 DB，不再硬编码字典
+decision = run_agentic_workflow(history, price_lookup=lambda lid: db.get_price(lid))
+```
+
+```bash
+python3 agentic_workflows_prod.py "Can I schedule a call with an agent?"
+python3 agentic_workflows_prod.py "..." --json     # 完整 RouteDecision（含每路原文与错误）
+python3 agentic_workflows_prod.py "..." -v         # 打开重试/降级日志
+```
+
+**新增环境变量**（都有默认值，不配也能跑）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MAX_CONCURRENCY` | `3` | 并发上限。免费档 1–3，别盲目调大 |
+| `REQUEST_TIMEOUT_TOTAL` | `20` | 单次尝试总超时（秒） |
+| `REQUEST_TIMEOUT_CONNECT` | `5` | 建连超时（秒） |
+| `REQUEST_TIMEOUT_SOCK_READ` | `15` | 读取超时（秒） |
+| `MAX_RETRIES` | `2` | 额外重试次数（0 = 不重试） |
+| `RETRY_BASE_DELAY` / `RETRY_MAX_DELAY` / `RETRY_JITTER` | `0.5` / `8` / `0.3` | 退避基数、上限、抖动比例 |
+| `MAX_TOKENS` / `TEMPERATURE` | `100` / `0.1` | 采样参数。分类任务建议 `TEMPERATURE=0` 降抖动 |
+| `STRICT_TOKENS` | 跟随 `PROMPT_VARIANT` | token 白名单开关。跑 `original` 变体时必须为 `false` |
+
+**回归测试**
+
+```bash
+python3 test_prod.py --only fault   # 离线：注入 429 / 500 / 超时 / 坏 JSON / 脏输出 / 跑偏长文本
+python3 test_prod.py --only real    # 真实端点：7 条路由
+python3 test_prod.py                # 全跑
+```
+
+`--only fault` 用本地故障端点验证补强真的生效，实测 26/26 通过，其中几条关键断言：
+
+- 429 连打两次后重试成功 → 不降级、不抛异常
+- 持续 500 → 三路全失败，降级到 fallback 而不是崩溃
+- 只有 pricing 路挂 → 跳过它，scheduling 分支照样命中
+- 端点 sleep 不返回 → 1.01s 熔断（不卡死）
+- HTTP 200 但响应体缺 `choices` → 只打 1 次（不可重试错误不重试）
+- `MAX_CONCURRENCY=1/2/3` → 实测并发峰值 1/2/3，耗时 1.23s / 0.81s / 0.41s（三路 × 0.4s，与限流数学一致）
+- 白名单关 → 跑偏的长文本被透出给用户（反面用例）；白名单开 → 拦下，落到正确分支
