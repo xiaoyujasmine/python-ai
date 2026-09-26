@@ -41,38 +41,59 @@ Response: The price for listing 123456 is $350,000.
 配置读取顺序：**命令行 export > `.env` > 代码默认值**（`http://your_server_ip:8000/v1/chat/completions`，需自行替换）。
 三个入口脚本（`test_workflow.py` / `demo_routes.py` / `check_provider.py`）启动时都会自动加载 `.env`，无需反复 export。
 
-### 获取 SiliconFlow API key
+### 获取 API key
 
-> 没有"开源的 API key"这回事——key 是厂商签发的身份凭证，与模型是否开源无关。这里说的是**开源/免费模型的免费调用额度**。
+> 没有"开源的 API key"这回事——key 是厂商签发的身份凭证，与模型是否开源无关。这里说的是**开源/免费模型的调用额度**。
+
+#### DeepSeek（当前默认）
+
+1. 注册：打开 https://platform.deepseek.com ，手机号或微信登录
+2. 建 key：左侧 **API keys** → **Create new key** → 复制 `sk-` 开头那串
+   - **只显示一次**，关掉弹窗就找不回来了
+3. **充值**：DeepSeek **没有免费额度**，余额为 0 时所有模型一律 `402 Insufficient Balance`
+   - 查余额：`GET https://api.deepseek.com/user/balance`
+4. 填进 `.env`：`LLM_API_KEY=sk-你的key`
+
+可用模型（2026-09 实测 `/v1/models`，老的 `deepseek-chat` / `deepseek-reasoner` **已下架**）：
+
+| 模型 ID | 说明 |
+|---|---|
+| `deepseek-flash` | DeepSeek-V4.1-Flash，1M 上下文，便宜，跑本 demo 用这个 |
+| `deepseek-v4-pro` | 更强更贵 |
+
+#### 硅基流动 SiliconFlow（备用）
 
 1. 注册：打开 https://cloud.siliconflow.cn ，手机号验证码或 GitHub 登录
-2. **实名认证**：控制台内完成，未实名领不到免费额度（国内平台合规要求）
+2. **实名认证**：控制台内完成，未实名领不到免费额度（国内平台合规要求），无实名时调用报 `402`
 3. 领额度：账户中心 → 资源包，注册赠送的 token 在此确认到账
 4. 建 key：左侧 **API 密钥** → **新建密钥** → 复制 `sk-` 开头那串
    - 直达链接：https://cloud.siliconflow.cn/account/ak
-   - **只显示一次**，关掉弹窗就找不回来了，立刻存好
-5. 填进 `.env`：`LLM_API_KEY=sk-你的key`
+5. 填进 `.env`，并把端点换成 `https://api.siliconflow.cn/v1/chat/completions`
 
-然后自检：
+9B 以下模型永久免费（`Qwen/Qwen2.5-7B-Instruct` 等），但限速约 5–10 QPS 且有 TPM 上限，超了返回 429。平台**没有 Mistral 系列**，教程原配的 `Mistral-Small-3.2-24B` 用不了。
+
+#### 自检
 
 ```bash
 python3 check_provider.py     # 端点 -> key -> 模型，逐级验证
 python3 demo_routes.py        # 7 个路由分支
 ```
 
-自检输出示例（key 还没填时会这样）：
+key 有效但没余额时的输出（DeepSeek / SiliconFlow 都是 402）：
 
 ```
-[env] 已加载 .../python-ai/.env（3 项）；命令行 export 的值优先
-endpoint : https://api.siliconflow.cn/v1/chat/completions
-api key  : 未设置（本地无鉴权模式）
-model    : Qwen/Qwen2.5-7B-Instruct
+endpoint : https://api.deepseek.com/v1/chat/completions
+api key  : 已设置 (sk-***f702)
+model    : deepseek-flash
 
-[WARN] GET https://api.siliconflow.cn/v1/models 不可用 -> HTTP 401: {"code":30014,...,"message":"Token is invalid."}
-[FAIL] HTTP 401：API key 无效或未设置（LLM_API_KEY 当前长度 0）
+[OK]   端点可达，共 2 个模型。前 20 个：
+       deepseek-flash  <-- 当前使用
+       deepseek-v4-pro
+
+[FAIL] HTTP 402：账户余额不足，key 本身有效。去控制台充值/领额度后重试
 ```
 
-**免费档注意**：9B 以下模型永久免费，但限速约 5–10 QPS 且有 TPM 上限，超了返回 429。`demo_routes.py` 一次跑 7 个 case × 3 次并发 = 21 次调用，密集跑容易撞线——撞了就歇一分钟，或改用付费档。
+`402` = key 有效但没钱，`401` = key 无效，两者别搞混——前者不用去重新建 key。
 
 ### 本地无 GPU / 无 API key 时跑通
 
@@ -163,18 +184,18 @@ conversation_history
 - `asyncio.gather` 按入参顺序返回结果，配合 `prompt_names.index(...)` 回填响应
 - 决策完全由确定性 `if/elif` 完成，LLM 只负责分类与抽取
 
-### 接入真实模型：硅基流动 SiliconFlow
+### 接入真实模型
 
-默认走 SiliconFlow：国内直连（已实测本机无需代理）、OpenAI 兼容、9B 以下模型永久免费。
+默认走 DeepSeek：国内直连（已实测本机无需代理）、OpenAI 兼容。备选 SiliconFlow（9B 以下免费）、智谱、百炼、OpenRouter，都在 `.env.example` 里。
 
-**1. 拿 key**：注册 https://cloud.siliconflow.cn → 左侧「API 密钥」→ 新建密钥，复制 `sk-` 开头那串。
+**1. 拿 key**：见上一节。
 
 **2. 填配置**（复制 `.env.example` 为 `.env`，或直接 export）：
 
 ```bash
-export VLLM_SERVER_URL="https://api.siliconflow.cn/v1/chat/completions"
+export VLLM_SERVER_URL="https://api.deepseek.com/v1/chat/completions"
 export LLM_API_KEY="sk-xxxxxxxx"
-export LLM_MODEL_ID="Qwen/Qwen2.5-7B-Instruct"
+export LLM_MODEL_ID="deepseek-flash"
 ```
 
 **3. 先自检再跑**：
@@ -185,12 +206,12 @@ python3 demo_routes.py        # 7 个分支全覆盖
 python3 test_workflow.py      # 教程的两个场景
 ```
 
-免费档常用模型：`Qwen/Qwen2.5-7B-Instruct`、`Qwen/Qwen3-8B`、`THUDM/GLM-4-9B-0414`、`deepseek-ai/DeepSeek-R1-0528-Qwen3-8B`。平台上下架和调价频繁，用 `check_provider.py` 拉一次模型列表确认。
+模型上下架和调价频繁，用 `check_provider.py` 拉一次列表确认当前可用 ID。
 
 **注意两点**：
 
-- 免费档限速限并发（约 5–10 QPS，TPM 也有上限），超出返回 429「TPM limit reached」。本工作流每个 case 并发 3 个请求，密集跑容易撞上限——要么加 `Semaphore` 限流，要么换 Pro 档。
-- 教程的提示要求模型**只**输出 `listing_id: XXXXXX` / `date: ...` / `false`。7B~9B 不一定守得住格式，换模型后必须 `demo_routes.py` 重跑，必要时改写提示或换更大模型。
+- 免费档限速限并发（约 5–10 QPS，TPM 也有上限），超出返回 429「TPM limit reached」。本工作流每个 case 并发 3 个请求，`demo_routes.py` 一次 21 次调用，密集跑容易撞上限——要么加 `Semaphore` 限流，要么换付费档。
+- 教程的提示要求模型**只**输出 `listing_id: XXXXXX` / `date: ...` / `false`。小模型不一定守得住格式，换模型后必须 `demo_routes.py` 重跑，必要时改写提示或换更大模型。
 
 **其他可切换的平台**（改上面两三个环境变量即可，都写在 `.env.example` 里）：
 

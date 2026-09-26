@@ -88,6 +88,9 @@ async def ping_model(session, model_id):
     if status == 429:
         print(f"[FAIL] HTTP 429：触发限流（免费档限制较严）。稍后重试或换 Pro 档：{text[:200]}")
         return False
+    if status == 402:
+        print(f"[FAIL] HTTP 402：账户余额不足，key 本身有效。去控制台充值/领额度后重试：{text[:200]}")
+        return False
     if status != 200:
         print(f"[FAIL] HTTP {status}: {text[:300]}")
         return False
